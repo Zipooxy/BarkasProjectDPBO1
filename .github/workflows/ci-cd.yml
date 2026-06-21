@@ -1,0 +1,242 @@
+name: CI/CD Pipeline - Barkas Project DPBO
+
+# =====================================================================================
+# STRATEGI TRIGGER & BRANCHING
+#   - push/PR ke branch dev atau feature/** -> menjalankan build, test, inspect (CI/CT/CI)
+#   - push ke branch main (umumnya hasil merge dari dev/feature) -> menjalankan
+#     build, test, inspect, lalu deploy-staging dan deploy-production (CD)
+#   - workflow_dispatch -> memungkinkan trigger manual untuk keperluan demonstrasi video
+# =====================================================================================
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '21'
+
+# Izin minimum yang dibutuhkan: contents:write untuk membuat GitHub Release pada tahap
+# deploy, checks:write & pull-requests:write untuk publish laporan hasil test ke PR.
+permissions:
+  contents: write
+  checks: write
+  pull-requests: write
+
+jobs:
+
+  # ===================================================================================
+  # 1. CONTINUOUS INTEGRATION
+  #    Build/compile otomatis setiap push/PR, kelola dependensi via Maven, dan laporkan
+  #    status build (sukses/gagal) secara otomatis lewat status check job ini di GitHub.
+  # ===================================================================================
+  build:
+    name: build (Continuous Integration)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compile project & resolve dependencies (Maven)
+        run: mvn -B clean compile
+
+      - name: Upload hasil kompilasi
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-classes
+          path: target/classes
+          retention-days: 1
+
+  # ===================================================================================
+  # 2. CONTINUOUS TESTING
+  #    Menjalankan unit test otomatis (JUnit 5 + Maven Surefire). Pipeline akan GAGAL
+  #    secara otomatis apabila ada test yang tidak lulus (exit code mvn test != 0).
+  # ===================================================================================
+  test:
+    name: test (Continuous Testing)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # Tahap ini akan FAIL otomatis jika ada satu pun unit test yang gagal,
+      # karena Maven Surefire mengembalikan exit code != 0.
+      - name: Run unit tests (JUnit 5 via Maven Surefire)
+        run: mvn -B test
+
+      - name: Upload laporan hasil test (Surefire)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-test-report
+          path: target/surefire-reports
+          retention-days: 14
+
+      - name: Upload laporan code coverage (JaCoCo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-coverage-report
+          path: target/site/jacoco
+          retention-days: 14
+
+      # Menampilkan hasil test secara visual di tab "Actions" / Job Summary GitHub,
+      # termasuk anotasi pass/fail per test case.
+      - name: Publish ringkasan hasil test ke GitHub Actions
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Laporan JUnit Test
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: true
+
+  # ===================================================================================
+  # 3. CONTINUOUS INSPECTION
+  #    Analisis kualitas kode statis menggunakan SonarCloud. Job ini akan GAGAL apabila
+  #    Quality Gate SonarCloud berstatus "Failed" (parameter -Dsonar.qualitygate.wait=true
+  #    membuat proses menunggu hasil Quality Gate lalu mengembalikan exit code != 0
+  #    jika hasilnya merah).
+  #
+  #    Secret & variable yang WAJIB dikonfigurasi di Settings > Secrets and variables:
+  #      - secrets.SONAR_TOKEN        -> token dari SonarCloud (My Account > Security)
+  #      - vars.SONAR_PROJECT_KEY     -> project key dari SonarCloud
+  #      - vars.SONAR_ORGANIZATION    -> organization key dari SonarCloud
+  # ===================================================================================
+  inspect:
+    name: inspect (Continuous Inspection)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # diperlukan SonarCloud untuk analisis blame & new code
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Build, test, dan analisis dengan SonarCloud
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+          -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+          -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+          -Dsonar.host.url=https://sonarcloud.io
+          -Dsonar.token=${{ secrets.SONAR_TOKEN }}
+          -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+          -Dsonar.qualitygate.wait=true
+
+  # ===================================================================================
+  # 4. CONTINUOUS DELIVERY - STAGING
+  #    Hanya berjalan ketika ada push ke branch main (hasil merge). Build artifact (jar)
+  #    otomatis "dideploy" ke environment staging (tanpa approval manual) berupa
+  #    GitHub Pre-Release sebagai representasi lingkungan staging.
+  # ===================================================================================
+  deploy-staging:
+    name: deploy-staging (Continuous Delivery)
+    runs-on: ubuntu-latest
+    needs: inspect
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Package application (jar)
+        run: mvn -B package -DskipTests
+
+      - name: Upload build artifact (staging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: barkas-staging-build
+          path: target/*.jar
+
+      - name: Publish ke environment staging (GitHub Pre-Release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: staging-${{ github.run_number }}
+          name: "Staging Build #${{ github.run_number }}"
+          prerelease: true
+          files: target/*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===================================================================================
+  # 5. CONTINUOUS DELIVERY - PRODUCTION
+  #    Hanya berjalan setelah deploy-staging sukses. Job ini menggunakan
+  #    environment "production" yang WAJIB dikonfigurasi dengan "Required reviewers"
+  #    di Settings > Environments agar job berhenti dan menunggu PERSETUJUAN MANUAL
+  #    sebelum benar-benar mempublikasikan rilis ke production.
+  # ===================================================================================
+  deploy-production:
+    name: deploy-production (Continuous Delivery - butuh approval manual)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Package application (jar)
+        run: mvn -B package -DskipTests
+
+      - name: Publish rilis production (GitHub Release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Release v1.0.${{ github.run_number }}"
+          prerelease: false
+          files: target/*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
